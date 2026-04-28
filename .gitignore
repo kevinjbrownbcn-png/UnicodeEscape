@@ -1,0 +1,15 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# --- PyInstaller ---
+build/
+dist/
+*.manifest
+
+# --- Environment ---
+.venv/
+venv/
+.env
