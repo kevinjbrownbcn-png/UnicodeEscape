@@ -1,0 +1,19 @@
+{
+  "name": "Properties Unicode Escaper",
+  "glyph": "🔤",
+  "subtitle": "Pick a build mode and run it in a console",
+  "footer": "© {year} Properties Unicode Escaper | Build Launcher",
+  "script": "build_exe.py",
+  "icon": "assets/icon.ico",
+  "readme": "README.md",
+  "note": "Output goes to dist/. When it's done the console title says finished or FAILED, with a summary at the end and a sound. Needs Python and PyInstaller.",
+  "modes": [
+    {"label": "Regular", "desc": "Single windowed .exe built from escape_properties_gui.spec", "args": ["regular"]},
+    {"label": "Portable", "desc": "Single .exe that runs without installing, no console", "args": ["onefile"]},
+    {"label": "Folder", "desc": "Unpacked folder with the .exe and its files, faster startup", "args": ["onedir"]},
+    {"label": "Debug", "desc": "Unpacked folder with a console window and verbose boot logging", "args": ["debug"]}
+  ],
+  "options": [
+    {"id": "open", "label": "Open the output folder when it's done", "default": true, "args_on": ["--open"]}
+  ]
+}

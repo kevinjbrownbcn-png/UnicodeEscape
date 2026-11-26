@@ -1,175 +1,17 @@
 # --- Imports ---
-# os: used for path manipulation, directory creation, and file existence checks.
-# re: used for two purposes — matching existing \uXXXX escape sequences to avoid
-#     double-escaping them, and parsing the key/separator/value structure of each
-#     .properties line.
+# os/sys: used to locate README.md relative to the running app (script or exe).
 # tkinter (tk): Python's built-in GUI library.
 # filedialog: tkinter submodule for native OS folder picker dialogs.
 # messagebox: tkinter submodule for error and completion popup dialogs.
+# core: pure processing logic (no UI code), reusable by any future frontend.
+# theme: colour palettes + persisted light/dark preference.
 import os
-import re
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-# ---------- Core escape logic ----------
-
-def escape_non_latin(text):
-    r"""Escape characters beyond Latin-1, preserving \uXXXX and \UXXXXXXXX sequences."""
-    # --- escape_non_latin ---
-    # Walks through the value string character by character. For each character:
-    #   - If it looks like the start of an existing \uXXXX or \UXXXXXXXX escape
-    #     sequence, the full sequence is matched and passed through unchanged.
-    #     This prevents double-escaping values that are already escaped.
-    #   - If the character's Unicode code point is above 0x00FF (i.e. outside
-    #     the Latin-1 range), it is encoded to its \uXXXX escape form using
-    #     Python's built-in unicode_escape codec.
-    #   - All other characters (ASCII and Latin-1 accented characters) are kept as-is.
-    escaped = []
-    i = 0
-    while i < len(text):
-        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] in ("u", "U"):
-            # Attempt to match a full existing escape sequence at this position.
-            # If matched, append it verbatim and skip past it entirely.
-            match = re.match(r"\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}", text[i:])
-            if match:
-                escaped.append(match.group(0))
-                i += len(match.group(0))
-                continue
-        char = text[i]
-        if ord(char) > 0x00FF:  # Beyond Latin-1
-            escaped.append(char.encode("unicode_escape").decode("ascii"))
-        else:
-            escaped.append(char)
-        i += 1
-    return "".join(escaped)
-
-def process_properties_line(line):
-    """Escape only the value part of a .properties line."""
-    # --- process_properties_line ---
-    # Handles a single line from a .properties file. Three cases:
-    #   1. Blank lines and comment lines (starting with # or !) are returned
-    #      unchanged — they have no value to escape.
-    #   2. Key/value lines are split into three groups using a regex:
-    #        Group 1 (key):   everything before the separator
-    #        Group 2 (sep):   the separator itself (=, :, or surrounding whitespace)
-    #        Group 3 (value): everything after the separator
-    #      Only the value is passed to escape_non_latin; the key and separator
-    #      are reassembled unchanged.
-    #   3. Lines that don't match the regex (e.g. malformed lines) are returned as-is.
-    #
-    # Note on the regex separator character class [:=\s]+:
-    #   Matches one or more of: colon, equals sign, or whitespace. This covers
-    #   all standard .properties separator styles (key=value, key = value, key: value).
-    line = line.rstrip("\n")
-    if not line.strip() or line.strip().startswith(("#", "!")):
-        return line
-    match = re.match(r'([^:=\s][^:=]*)([:=\s]+)(.*)', line)
-    if match:
-        key, sep, value = match.groups()
-        escaped_value = escape_non_latin(value)
-        return f"{key}{sep}{escaped_value}"
-    return line
-
-def process_file(src_path, dest_path, log_changes=False, preserve_trailing_newline=False):
-    """Process a single .properties file and optionally log changes."""
-    # --- process_file ---
-    # Reads a single .properties file, processes each line through
-    # process_properties_line, and writes the result to dest_path.
-    #
-    # UTF-8 decoding: if the file can't be read as UTF-8, it is skipped
-    # entirely and reported rather than crashing — useful when a folder
-    # contains mixed-encoding files.
-    #
-    # Change tracking: when log_changes=True, any line whose escaped version
-    # differs from the original is recorded as "Line N: before → after".
-    # These are returned to process_folder for writing to changes.log.
-    #
-    # Output directory: os.makedirs is only called when dest_path has a
-    # directory component — calling it with an empty string would raise
-    # FileNotFoundError for files sitting directly in the destination folder.
-    #
-    # Trailing newline: "\n".join(...) does not add a newline at the end of
-    # the file. If preserve_trailing_newline=True (set via the UI checkbox),
-    # one is appended. Leave unticked if the target toolchain is strict about
-    # not having a trailing newline.
-    try:
-        with open(src_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except UnicodeDecodeError:
-        print(f"⚠️ Skipped (not UTF-8): {src_path}")
-        return False, []
-
-    escaped_lines = []
-    changes = []
-
-    for idx, line in enumerate(lines, start=1):
-        escaped_line = process_properties_line(line)
-        escaped_lines.append(escaped_line)
-        if log_changes and escaped_line != line.rstrip("\n"):
-            changes.append(f"Line {idx}: {line.rstrip()} → {escaped_line}")
-
-    dest_dir = os.path.dirname(dest_path)
-    if dest_dir:
-        os.makedirs(dest_dir, exist_ok=True)
-
-    output = "\n".join(escaped_lines)
-    if preserve_trailing_newline:
-        output += "\n"
-
-    with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(output)
-
-    return True, changes
-
-def process_folder(src_folder, dest_folder, log_callback=None, log_changes=False, preserve_trailing_newline=False):
-    """Recursively process all .properties files and log changes if requested."""
-    # --- process_folder ---
-    # Walks src_folder recursively via os.walk, finds every .properties file,
-    # and calls process_file for each one. The relative path of each file is
-    # preserved so the output folder mirrors the source folder structure exactly.
-    #
-    # log_callback is an optional function the caller provides to receive
-    # per-file progress messages — the UI passes self.log so output appears
-    # in the on-screen log panel in real time.
-    #
-    # changes.log: if any lines were modified across the run, a single
-    # changes.log file is written to the root of dest_folder summarising
-    # every change made. It is only created if there were actual changes —
-    # a clean run (nothing needed escaping) produces no log file.
-    count = 0
-    all_changes = []
-
-    for root, _, files in os.walk(src_folder):
-        for filename in files:
-            if filename.lower().endswith(".properties"):
-                src_path = os.path.join(root, filename)
-                rel_path = os.path.relpath(src_path, src_folder)
-                dest_path = os.path.join(dest_folder, rel_path)
-                success, changes = process_file(
-                    src_path, dest_path,
-                    log_changes=log_changes,
-                    preserve_trailing_newline=preserve_trailing_newline
-                )
-                if success:
-                    count += 1
-                    if log_callback:
-                        log_callback(f"✅ Processed: {src_path}")
-                        for change in changes:
-                            log_callback(f"   {change}")
-                    if changes:
-                        all_changes.append((src_path, changes))
-
-    # Write a full changes.log in the output folder
-    if all_changes:
-        log_file = os.path.join(dest_folder, "changes.log")
-        with open(log_file, "w", encoding="utf-8") as f:
-            for file_path, changes in all_changes:
-                f.write(f"File: {file_path}\n")
-                for change in changes:
-                    f.write(f"   {change}\n")
-                f.write("\n")
-
-    return count
+import theme as theme_module
+from core import GROUPS, GROUP_KEYS, process_folder, validate_folders
 
 # ---------- UI ----------
 
@@ -181,44 +23,307 @@ class EscapeApp:
         # BooleanVar) that are read by the run() method when the Run button is clicked.
         #
         # Layout (top to bottom):
+        #   - Header bar: app title + light/dark theme toggle
         #   - Input folder field + Browse button
         #   - Output folder field + Browse button
+        #   - "Characters to escape" panel: one checkbox per character group,
+        #     All/None buttons, remember-selection checkbox, Java 8 warning
         #   - Trailing newline checkbox
         #   - Run button
-        #   - Scrollable log panel
+        #   - Log panel
+        #   - Footer bar: copyright + README link
         #
-        # The log panel (tk.Text) is kept in state="disabled" at rest to prevent
-        # the user from typing into it. It is briefly set to "normal" by the log()
-        # method to insert new lines, then immediately disabled again.
+        # Theme: widgets are built without colours first, then colour is applied
+        # in one pass by apply_theme() so toggling the theme later just re-runs
+        # that same pass rather than duplicating colour logic.
         self.root = root
         self.root.title("Properties Unicode Escaper")
-        self.root.geometry("650x490")
+        self.root.geometry("650x720")
         self.root.resizable(False, False)
 
-        tk.Label(root, text="Input Folder:", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 0))
-        self.input_var = tk.StringVar()
-        tk.Entry(root, textvariable=self.input_var, width=80).pack(padx=10, pady=2)
-        tk.Button(root, text="Browse", command=self.browse_input).pack(padx=10, pady=2)
+        # Window/taskbar icon instead of Tk's default feather. The .ico is bundled
+        # in frozen builds (resource_dir()); a missing file just keeps the default.
+        try:
+            self.root.iconbitmap(os.path.join(theme_module.resource_dir(), "assets", "icon.ico"))
+        except tk.TclError:
+            pass
 
-        tk.Label(root, text="Output Folder:", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 0))
+        self.theme_name = theme_module.load_theme()
+        self.palette = theme_module.THEMES[self.theme_name]
+
+        # Footer is packed with side="bottom" before the expanding body: pack()
+        # carves up space in the order widgets are packed, so the body's
+        # fill="both"/expand=True would otherwise claim the whole remaining
+        # cavity and leave nothing for a widget packed after it.
+        self._build_header()
+        self._build_footer()
+        self._build_body()
+
+        self.apply_theme()
+
+    # ---------- Layout ----------
+
+    def _build_header(self):
+        self.header_frame = tk.Frame(self.root, height=48)
+        self.header_frame.pack(fill="x", side="top")
+        self.header_frame.pack_propagate(False)
+
+        self.title_label = tk.Label(
+            self.header_frame, text="Properties Unicode Escaper",
+            font=(theme_module.FONT_STACK, 12, "bold")
+        )
+        self.title_label.pack(side="left", padx=14)
+
+        self.theme_button = tk.Button(
+            self.header_frame, font=(theme_module.FONT_STACK, 9, "bold"),
+            relief="flat", bd=0, cursor="hand2", command=self.toggle_theme
+        )
+        self.theme_button.pack(side="right", padx=14)
+
+    def _build_body(self):
+        self.body_frame = tk.Frame(self.root)
+        self.body_frame.pack(fill="both", expand=True)
+
+        self.input_label = tk.Label(
+            self.body_frame, text="Input Folder:", font=(theme_module.FONT_STACK, 10, "bold")
+        )
+        self.input_label.pack(anchor="w", padx=10, pady=(10, 0))
+        self.input_var = tk.StringVar()
+        self.input_entry = tk.Entry(self.body_frame, textvariable=self.input_var, width=80, relief="flat")
+        self.input_entry.pack(padx=10, pady=2, ipady=3)
+        self.input_browse_btn = tk.Button(
+            self.body_frame, text="Browse", relief="flat", bd=0, cursor="hand2", command=self.browse_input
+        )
+        self.input_browse_btn.pack(padx=10, pady=2)
+
+        self.output_label = tk.Label(
+            self.body_frame, text="Output Folder:", font=(theme_module.FONT_STACK, 10, "bold")
+        )
+        self.output_label.pack(anchor="w", padx=10, pady=(10, 0))
         self.output_var = tk.StringVar()
-        tk.Entry(root, textvariable=self.output_var, width=80).pack(padx=10, pady=2)
-        tk.Button(root, text="Browse", command=self.browse_output).pack(padx=10, pady=2)
+        self.output_entry = tk.Entry(self.body_frame, textvariable=self.output_var, width=80, relief="flat")
+        self.output_entry.pack(padx=10, pady=2, ipady=3)
+        self.output_browse_btn = tk.Button(
+            self.body_frame, text="Browse", relief="flat", bd=0, cursor="hand2", command=self.browse_output
+        )
+        self.output_browse_btn.pack(padx=10, pady=2)
+
+        self._build_groups_panel()
 
         # Trailing newline checkbox: tick if the target toolchain requires files
         # to end with a newline. Leave unticked if it doesn't. Defaults to off.
         self.trailing_newline_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            root,
+        self.trailing_newline_check = tk.Checkbutton(
+            self.body_frame,
             text="Preserve trailing newline at end of file",
-            variable=self.trailing_newline_var
-        ).pack(anchor="w", padx=10, pady=(8, 0))
+            variable=self.trailing_newline_var,
+            font=(theme_module.FONT_STACK, 9)
+        )
+        self.trailing_newline_check.pack(anchor="w", padx=10, pady=(8, 0))
 
-        tk.Button(root, text="Run", font=("Segoe UI", 10, "bold"), bg="#4CAF50", fg="white", command=self.run).pack(pady=10)
+        self.run_button = tk.Button(
+            self.body_frame, text="Run", font=(theme_module.FONT_STACK, 10, "bold"),
+            relief="flat", bd=0, cursor="hand2", command=self.run
+        )
+        self.run_button.pack(pady=10)
 
-        tk.Label(root, text="Log:", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 0))
-        self.log_box = tk.Text(root, height=15, width=80, state="disabled", bg="#f9f9f9")
+        self.log_label = tk.Label(self.body_frame, text="Log:", font=(theme_module.FONT_STACK, 10, "bold"))
+        self.log_label.pack(anchor="w", padx=10, pady=(10, 0))
+        self.log_box = tk.Text(
+            self.body_frame, height=9, width=80, state="disabled", relief="flat", wrap="word"
+        )
         self.log_box.pack(padx=10, pady=5)
+
+    def _build_groups_panel(self):
+        # One checkbox per character group (core.GROUPS), all ticked by default.
+        # Starting selection: all groups, unless the user previously ticked
+        # "Remember selection" — then the saved selection is restored.
+        settings = theme_module.load_settings()
+        remember = bool(settings.get("remember_groups", False))
+        saved = settings.get("groups")
+        selected = set(GROUP_KEYS)
+        if remember and isinstance(saved, list):
+            selected = {key for key in saved if key in GROUP_KEYS}
+
+        self.group_vars = {key: tk.BooleanVar(value=key in selected) for key in GROUP_KEYS}
+        self.remember_var = tk.BooleanVar(value=remember)
+
+        self.groups_header = tk.Frame(self.body_frame)
+        self.groups_header.pack(fill="x", padx=10, pady=(10, 0))
+        self.groups_label = tk.Label(
+            self.groups_header, text="Characters to escape:", font=(theme_module.FONT_STACK, 10, "bold")
+        )
+        self.groups_label.pack(side="left")
+        self.none_btn = tk.Button(
+            self.groups_header, text="None", relief="flat", bd=0, cursor="hand2",
+            font=(theme_module.FONT_STACK, 8), command=lambda: self._set_all_groups(False)
+        )
+        self.none_btn.pack(side="right", padx=(4, 0))
+        self.all_btn = tk.Button(
+            self.groups_header, text="All", relief="flat", bd=0, cursor="hand2",
+            font=(theme_module.FONT_STACK, 8), command=lambda: self._set_all_groups(True)
+        )
+        self.all_btn.pack(side="right", padx=(4, 0))
+
+        # Checkboxes laid out in a 3-column grid, in core.GROUPS order.
+        self.groups_frame = tk.Frame(self.body_frame)
+        self.groups_frame.pack(fill="x", padx=10, pady=(2, 0))
+        self.group_checks = []
+        for index, (key, label, _example, _ranges) in enumerate(GROUPS):
+            check = tk.Checkbutton(
+                self.groups_frame, text=label, variable=self.group_vars[key],
+                font=(theme_module.FONT_STACK, 9), anchor="w", command=self._on_groups_changed
+            )
+            check.grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 12))
+            self.group_checks.append(check)
+        for column in range(3):
+            self.groups_frame.grid_columnconfigure(column, weight=1, uniform="groups")
+
+        self.remember_check = tk.Checkbutton(
+            self.body_frame, text="Remember this selection next session",
+            variable=self.remember_var, font=(theme_module.FONT_STACK, 9),
+            command=self._on_remember_changed
+        )
+        self.remember_check.pack(anchor="w", padx=10, pady=(4, 0))
+
+        # Fixed two-line height so the layout doesn't jump when a warning appears.
+        self.groups_warning = tk.Label(
+            self.body_frame, text="", font=(theme_module.FONT_STACK, 8),
+            justify="left", anchor="nw", wraplength=620, height=2
+        )
+        self.groups_warning.pack(fill="x", padx=10)
+        self._update_groups_warning()
+
+    def _build_footer(self):
+        # Standard footer bar: copyright/tagline on the left, a README link on
+        # the right in place of the usual sibling-app nav (this is a standalone
+        # tool with no other apps in the suite to link to).
+        self.footer_frame = tk.Frame(self.root, height=32)
+        self.footer_frame.pack(fill="x", side="bottom")
+        self.footer_frame.pack_propagate(False)
+
+        self.footer_border = tk.Frame(self.footer_frame, height=1)
+        self.footer_border.pack(fill="x", side="top")
+
+        self.copyright_label = tk.Label(
+            self.footer_frame,
+            text="© 2026 Properties Unicode Escaper | Unicode-safe .properties files",
+            font=(theme_module.FONT_STACK, 8)
+        )
+        self.copyright_label.pack(side="left", padx=14)
+
+        self.readme_link = tk.Label(
+            self.footer_frame, text="README", font=(theme_module.FONT_STACK, 8, "bold"), cursor="hand2"
+        )
+        self.readme_link.pack(side="right", padx=14)
+        self.readme_link.bind("<Button-1>", self.open_readme)
+
+    # ---------- Theme ----------
+
+    def toggle_theme(self):
+        # Flips between dark and light, persists the choice, and restyles
+        # every widget in one pass via apply_theme().
+        self.theme_name = "light" if self.theme_name == "dark" else "dark"
+        self.palette = theme_module.THEMES[self.theme_name]
+        theme_module.save_theme(self.theme_name)
+        self.apply_theme()
+
+    def apply_theme(self):
+        p = self.palette
+
+        self.root.configure(bg=p["bg"])
+
+        self.header_frame.configure(bg=p["header"])
+        self.title_label.configure(bg=p["header"], fg=p["text"])
+        self.theme_button.configure(
+            text="☀  Light Mode" if self.theme_name == "dark" else "🌙  Dark Mode",
+            bg=p["header"], fg=p["accent"],
+            activebackground=p["header"], activeforeground=p["accent"]
+        )
+
+        self.body_frame.configure(bg=p["bg"])
+        for label in (self.input_label, self.output_label, self.log_label):
+            label.configure(bg=p["bg"], fg=p["text"])
+
+        self.trailing_newline_check.configure(
+            bg=p["bg"], fg=p["text"], selectcolor=p["panel"],
+            activebackground=p["bg"], activeforeground=p["text"]
+        )
+
+        # Character-group panel
+        for frame in (self.groups_header, self.groups_frame):
+            frame.configure(bg=p["bg"])
+        self.groups_label.configure(bg=p["bg"], fg=p["text"])
+        for check in (*self.group_checks, self.remember_check):
+            check.configure(
+                bg=p["bg"], fg=p["text"], selectcolor=p["panel"],
+                activebackground=p["bg"], activeforeground=p["text"]
+            )
+        for btn in (self.all_btn, self.none_btn):
+            btn.configure(bg=p["panel"], fg=p["text"], activebackground=p["border"], activeforeground=p["text"])
+        self.groups_warning.configure(bg=p["bg"], fg=p["warning"])
+
+        for entry in (self.input_entry, self.output_entry):
+            entry.configure(
+                bg=p["panel"], fg=p["text"], insertbackground=p["text"],
+                highlightthickness=1, highlightbackground=p["border"], highlightcolor=p["accent"]
+            )
+
+        for btn in (self.input_browse_btn, self.output_browse_btn):
+            btn.configure(bg=p["panel"], fg=p["text"], activebackground=p["border"], activeforeground=p["text"])
+
+        self.run_button.configure(
+            bg=p["accent"], fg=p["on_accent"], activebackground=p["accent"], activeforeground=p["on_accent"]
+        )
+
+        self.log_box.configure(
+            bg=p["panel"], fg=p["text"], insertbackground=p["text"],
+            highlightthickness=1, highlightbackground=p["border"]
+        )
+
+        self.footer_frame.configure(bg=p["header"])
+        self.footer_border.configure(bg=p["border"])
+        self.copyright_label.configure(bg=p["header"], fg=p["muted"])
+        self.readme_link.configure(bg=p["header"], fg=p["accent"])
+
+    # ---------- Character groups ----------
+
+    def selected_groups(self):
+        # Keys of the ticked groups, in core.GROUPS order.
+        return [key for key in GROUP_KEYS if self.group_vars[key].get()]
+
+    def _set_all_groups(self, value):
+        for var in self.group_vars.values():
+            var.set(value)
+        self._on_groups_changed()
+
+    def _on_groups_changed(self):
+        self._update_groups_warning()
+        if self.remember_var.get():
+            theme_module.save_settings(groups=self.selected_groups())
+
+    def _on_remember_changed(self):
+        # Ticking saves the current selection; unticking forgets it, so the
+        # next launch starts with every group ticked again.
+        if self.remember_var.get():
+            theme_module.save_settings(remember_groups=True, groups=self.selected_groups())
+        else:
+            theme_module.save_settings(remember_groups=False, groups=None)
+
+    def _update_groups_warning(self):
+        # Unticked groups stay as raw UTF-8 in the output, which Java 8 (reading
+        # .properties as ISO-8859-1) will garble — warn rather than block.
+        selected = self.selected_groups()
+        if not selected:
+            text = "⚠ No groups selected — nothing will be escaped."
+        elif len(selected) < len(GROUP_KEYS):
+            text = ("⚠ Unticked groups stay as raw UTF-8 in the output. Java 8 reads "
+                    ".properties files as ISO-8859-1 and will garble them.")
+        else:
+            text = ""
+        self.groups_warning.config(text=text)
+
+    # ---------- Actions ----------
 
     def browse_input(self):
         # Opens a native OS folder picker. If the user selects a folder
@@ -234,6 +339,17 @@ class EscapeApp:
         path = filedialog.askdirectory(title="Select Output Folder")
         if path:
             self.output_var.set(path)
+
+    def open_readme(self, event=None):
+        # Opens README.md with the OS default handler. Falls back to a message
+        # box if the file isn't present. Uses resource_dir() (not app_dir())
+        # since a onefile build extracts bundled data into a temp folder,
+        # separate from the folder the exe itself runs from.
+        readme_path = os.path.join(theme_module.resource_dir(), "README.md")
+        try:
+            os.startfile(readme_path)
+        except OSError:
+            messagebox.showinfo("README", f"README not found at:\n{readme_path}")
 
     def log(self, message):
         # Appends a message to the log panel. The widget must be temporarily
@@ -256,11 +372,9 @@ class EscapeApp:
         # so it applies to every file in the run.
         src = self.input_var.get().strip()
         dest = self.output_var.get().strip()
-        if not src or not os.path.isdir(src):
-            messagebox.showerror("Error", "Please select a valid input folder.")
-            return
-        if not dest:
-            messagebox.showerror("Error", "Please select an output folder.")
+        error = validate_folders(src, dest)
+        if error:
+            messagebox.showerror("Error", error)
             return
 
         # Clear previous log output before starting a new run.
@@ -268,22 +382,37 @@ class EscapeApp:
         self.log_box.delete("1.0", "end")
         self.log_box.config(state="disabled")
 
+        groups = self.selected_groups()
+        if len(groups) < len(GROUP_KEYS):
+            names = [label for key, label, _e, _r in GROUPS if key in groups]
+            self.log("ℹ️ Escaping only: " + (", ".join(names) if names else "(nothing)"))
         self.log(f"🔍 Scanning {src} for .properties files...\n")
-        count = process_folder(
+        processed, copied = process_folder(
             src, dest,
             log_callback=self.log,
             log_changes=True,
-            preserve_trailing_newline=self.trailing_newline_var.get()
+            preserve_trailing_newline=self.trailing_newline_var.get(),
+            groups=groups
         )
-        self.log(f"\n✅ Done! {count} file(s) processed.\nOutput written to: {dest}")
-        messagebox.showinfo("Complete", f"Processing complete.\n{count} file(s) written to:\n{dest}\n\nA changes.log file has been created in the output folder.")
+        summary = f"{processed} file(s) processed"
+        if copied:
+            summary += f", {copied} copied unchanged (not UTF-8)"
+        self.log(f"\n✅ Done! {summary}.\nOutput written to: {dest}")
+        messagebox.showinfo(
+            "Complete",
+            f"Processing complete.\n{summary}.\nOutput folder:\n{dest}\n\n"
+            "If any lines changed, a changes.log file was written to the output folder."
+        )
 
 # ---------- Main ----------
 
-if __name__ == "__main__":
+def main():
     # Creates the root tkinter window, instantiates the app (which builds
     # all widgets in __init__), then hands control to tkinter's event loop.
     # The window stays open and responsive until the user closes it.
     root = tk.Tk()
-    app = EscapeApp(root)
+    EscapeApp(root)
     root.mainloop()
+
+if __name__ == "__main__":
+    main()

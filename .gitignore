@@ -13,3 +13,8 @@ dist/
 .venv/
 venv/
 .env
+
+# --- App settings ---
+escaper_settings.json
+# --- Build launcher: tools/build_gui.py is tracked, its PyInstaller .exe is not ---
+tools/*.exe
